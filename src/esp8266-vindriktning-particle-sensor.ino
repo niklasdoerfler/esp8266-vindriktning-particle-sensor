@@ -5,10 +5,16 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiManager.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
 
 #include "Config.h"
 #include "SerialCom.h"
 #include "Types.h"
+
+#define SEALEVELPRESSURE_HPA (1013.25)
+Adafruit_BME280 bme;
 
 particleSensorState_t state;
 
@@ -26,7 +32,7 @@ uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
 
 uint32_t statusPublishPreviousMillis = 0;
-const uint16_t statusPublishInterval = 30000; // 30 seconds = 30000 milliseconds
+const uint16_t statusPublishInterval = 10000; // 30 seconds = 30000 milliseconds
 
 char identifier[24];
 #define FIRMWARE_PREFIX "esp8266-vindriktning-particle-sensor"
@@ -85,6 +91,11 @@ void setup() {
     Serial.printf("PIN_UART_RX: %d\n", SerialCom::PIN_UART_RX);
 
     mqttReconnect();
+  
+    if (!bme.begin(0x76)) {
+        Serial.println("Could not find a valid BME280 sensor, check wiring!");
+        while (1);
+    }
 }
 
 void setupOTA() {
@@ -196,6 +207,11 @@ void publishState() {
     wifiJson["ip"] = WiFi.localIP().toString();
     wifiJson["rssi"] = WiFi.RSSI();
 
+    stateJson["temperature"] = bme.readTemperature();
+    stateJson["pressure"] = bme.readPressure() / 100.0F;
+    stateJson["altitude"] = bme.readAltitude(SEALEVELPRESSURE_HPA);
+    stateJson["humidity"] = bme.readHumidity();
+    
     stateJson["pm25"] = state.avgPM25;
 
     stateJson["wifi"] = wifiJson.as<JsonObject>();
