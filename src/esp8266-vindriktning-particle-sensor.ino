@@ -5,10 +5,19 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiManager.h>
-
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
 #include "Config.h"
 #include "SerialCom.h"
 #include "Types.h"
+
+
+ 
+
+#define SEALEVELPRESSURE_HPA (1013.25)
+Adafruit_BME280 bme;
+
 
 particleSensorState_t state;
 
@@ -26,7 +35,7 @@ uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
 
 uint32_t statusPublishPreviousMillis = 0;
-const uint16_t statusPublishInterval = 30000; // 30 seconds = 30000 milliseconds
+const uint16_t statusPublishInterval = 10000; // 10 seconds = 10000 milliseconds
 
 char identifier[24];
 #define FIRMWARE_PREFIX "esp8266-vindriktning-particle-sensor"
@@ -38,6 +47,21 @@ char MQTT_TOPIC_COMMAND[128];
 
 char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_TEMP_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_PRESSURE_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_ALTITUDE_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR[128];
+
+enum PublishType{
+    temperature,
+    pressure,
+    altitude,
+    humidity,
+    pm25,
+    ssid,
+    ip,
+    rssi
+};
 
 bool shouldSaveConfig = false;
 
@@ -66,6 +90,10 @@ void setup() {
 
     snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX, identifier);
     snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_TEMP_SENSOR, 127, "homeassistant/sensor/%s/%s_temperature/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_PRESSURE_SENSOR, 127, "homeassistant/sensor/%s/%s_pressure/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_ALTITUDE_SENSOR, 127, "homeassistant/sensor/%s/%s_altitude/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR, 127, "homeassistant/sensor/%s/%s_humidity/config", FIRMWARE_PREFIX, identifier);
 
     WiFi.hostname(identifier);
 
@@ -85,6 +113,11 @@ void setup() {
     Serial.printf("PIN_UART_RX: %d\n", SerialCom::PIN_UART_RX);
 
     mqttReconnect();
+  
+    if (!bme.begin(0x76)) {
+        Serial.println("Could not find a valid BME280 sensor, check wiring!");
+        while (1);
+    }
 }
 
 void setupOTA() {
@@ -126,7 +159,14 @@ void loop() {
 
         if (state.valid) {
             printf("Publish state\n");
-            publishState();
+            publishState(ssid);
+            publishState(ip);
+            publishState(rssi);
+            publishState(temperature);
+            publishState(pressure);
+            publishState(altitude);
+            publishState(humidity);
+            publishState(pm25);
         }
     }
 
@@ -187,21 +227,41 @@ bool isMqttConnected() {
     return mqttClient.connected();
 }
 
-void publishState() {
-    DynamicJsonDocument wifiJson(192);
-    DynamicJsonDocument stateJson(604);
-    char payload[256];
+void publishState(PublishType publishType) {
+    char payload[64];
+  
 
-    wifiJson["ssid"] = WiFi.SSID();
-    wifiJson["ip"] = WiFi.localIP().toString();
-    wifiJson["rssi"] = WiFi.RSSI();
+    switch (publishType)
+    {
+    case temperature:
+        snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/temperature", FIRMWARE_PREFIX, identifier);
+        snprintf(payload, 63, "%f", bme.readTemperature());
+        mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+        
+     case pressure:
+        snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/pressure", FIRMWARE_PREFIX, identifier);
+        snprintf(payload, 63, "%f", bme.readPressure() / 100.0F);
+        mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+        
+    case altitude:
+        snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/altitude", FIRMWARE_PREFIX, identifier);
+        snprintf(payload, 63, "%f", bme.readAltitude(SEALEVELPRESSURE_HPA));
+        mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+        
+    case humidity:
+       snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/humidity", FIRMWARE_PREFIX, identifier);
+       snprintf(payload, 63, "%f", bme.readHumidity());
+       mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+       
+    case pm25:
+        snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/pm25", FIRMWARE_PREFIX, identifier);
+        snprintf(payload, 63, "%d", state.avgPM25);
+        mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+        
 
-    stateJson["pm25"] = state.avgPM25;
-
-    stateJson["wifi"] = wifiJson.as<JsonObject>();
-
-    serializeJson(stateJson, payload);
-    mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+    default:
+        break;
+    }
 }
 
 void mqttCallback(char* topic, uint8_t* payload, unsigned int length) { }
@@ -248,6 +308,62 @@ void publishAutoConfig() {
 
     serializeJson(autoconfPayload, mqttPayload);
     mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PM25_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Temperature");
+    autoconfPayload["unit_of_measurement"] = "°C";
+    autoconfPayload["value_template"] = "{{value_json.temperature}}";
+    autoconfPayload["unique_id"] = identifier + String("_temperature");
+    autoconfPayload["icon"] = "mdi:temperature-celsius";
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_TEMP_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Pressure");
+    autoconfPayload["unit_of_measurement"] = "hPa";
+    autoconfPayload["value_template"] = "{{value_json.pressure}}";
+    autoconfPayload["unique_id"] = identifier + String("_pressure");
+    autoconfPayload["icon"] = "mdi:gauge";
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PRESSURE_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Altitude");
+    autoconfPayload["unit_of_measurement"] = "m";
+    autoconfPayload["value_template"] = "{{value_json.altitude}}";
+    autoconfPayload["unique_id"] = identifier + String("_altitude");
+    autoconfPayload["icon"] = "mdi:arrow-split-horizontal";
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_ALTITUDE_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Humidity");
+    autoconfPayload["unit_of_measurement"] = "g.kg-1";
+    autoconfPayload["value_template"] = "{{value_json.humidity}}";
+    autoconfPayload["unique_id"] = identifier + String("_humidity");
+    autoconfPayload["icon"] = "mdi:water-percent";
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR[0], &mqttPayload[0], true);
 
     autoconfPayload.clear();
 }
